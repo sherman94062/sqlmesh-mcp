@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sqlmesh-mcp"
+version = "0.1.0"
+description = "MCP server for SQLMesh — exposes data transformation operations as AI agent tools"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Mike Sherman", email = "msherman@humanauto.ai" }]
+requires-python = ">=3.10"
+keywords = ["mcp", "sqlmesh", "data-engineering", "llm", "ai-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "sqlmesh>=0.100.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+]
+
+[project.scripts]
+sqlmesh-mcp = "sqlmesh_mcp.server:mcp.run"
+
+[project.urls]
+Homepage = "https://github.com/sherman94062/sqlmesh-mcp"
+Repository = "https://github.com/sherman94062/sqlmesh-mcp"
+Issues = "https://github.com/sherman94062/sqlmesh-mcp/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
