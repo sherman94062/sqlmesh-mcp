@@ -20,13 +20,11 @@ Configuration (environment variables):
   SQLMESH_GATEWAY       Named gateway to use (optional)
 """
 
-import io
+import asyncio
 import json
 import os
-import subprocess
 import sys
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,63 +44,72 @@ mcp = FastMCP(
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
-def _get_context(project_path: Optional[str] = None):
-    """
-    Create and return a SQLMesh Context.
-
-    Resolution order for the project path:
-      1. Explicit ``project_path`` argument
-      2. ``SQLMESH_PROJECT_PATH`` environment variable
-      3. Current working directory
-    """
-    from sqlmesh import Context
-
-    path = Path(
-        project_path
-        or os.environ.get("SQLMESH_PROJECT_PATH", ".")
-    ).resolve()
-
-    kwargs: dict[str, Any] = {"paths": [path]}
-    gateway = os.environ.get("SQLMESH_GATEWAY")
-    if gateway:
-        kwargs["gateway"] = gateway
-
-    return Context(**kwargs)
-
-
-def _capture_stdout(fn, *args, **kwargs) -> tuple[Any, str]:
-    """
-    Execute *fn* while capturing everything it prints to stdout.
-
-    Returns (return_value, captured_text).
-    """
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        result = fn(*args, **kwargs)
-    return result, buf.getvalue().strip()
-
-
-def _run_cli(args: list[str], project_path: Optional[str] = None) -> str:
-    """
-    Run a SQLMesh CLI command in the project directory and return combined output.
-    Used for operations that are easier to consume via CLI output (e.g. lineage).
-    """
-    cwd = str(
+def _project_path(project_path: Optional[str] = None) -> str:
+    return str(
         Path(
             project_path or os.environ.get("SQLMESH_PROJECT_PATH", ".")
         ).resolve()
     )
-    cmd = [sys.executable, "-m", "sqlmesh"] + args
-    result = subprocess.run(
-        cmd,
+
+
+async def _run_python_script(script: str, project_path: Optional[str] = None) -> str:
+    """
+    Run a Python script in a subprocess that imports and uses SQLMesh.
+
+    This avoids SQLMesh's Context interfering with the MCP server's event loop.
+    The script should print its result to stdout as the last line.
+    """
+    cwd = _project_path(project_path)
+    gateway_env = os.environ.get("SQLMESH_GATEWAY", "")
+
+    wrapper = f"""
+import sys, os, json, traceback
+os.chdir({cwd!r})
+os.environ['SQLMESH_PROJECT_PATH'] = {cwd!r}
+if {gateway_env!r}:
+    os.environ['SQLMESH_GATEWAY'] = {gateway_env!r}
+
+try:
+    from sqlmesh import Context
+    _kwargs = {{"paths": [{cwd!r}]}}
+    if os.environ.get("SQLMESH_GATEWAY"):
+        _kwargs["gateway"] = os.environ["SQLMESH_GATEWAY"]
+    ctx = Context(**_kwargs)
+
+{script}
+except Exception as exc:
+    print(json.dumps({{"error": str(exc), "traceback": traceback.format_exc()}}))
+"""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", wrapper,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=120,
     )
-    output = result.stdout.strip()
-    if result.returncode != 0 and result.stderr:
-        output = (output + "\n" + result.stderr.strip()).strip()
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    output = stdout.decode().strip()
+    if not output:
+        err = stderr.decode().strip()
+        return json.dumps({"error": f"No output from subprocess", "stderr": err[-500:]})
+    return output
+
+
+async def _run_cli(args: list[str], project_path: Optional[str] = None) -> str:
+    """
+    Run a SQLMesh CLI command in the project directory and return combined output.
+    """
+    cwd = _project_path(project_path)
+    cmd = [sys.executable, "-m", "sqlmesh"] + args
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    output = stdout.decode().strip()
+    if proc.returncode != 0 and stderr:
+        output = (output + "\n" + stderr.decode().strip()).strip()
     return output or "(no output)"
 
 
@@ -110,7 +117,7 @@ def _run_cli(args: list[str], project_path: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def sqlmesh_model_list(project_path: Optional[str] = None) -> str:
+async def sqlmesh_model_list(project_path: Optional[str] = None) -> str:
     """
     List all models in the SQLMesh project.
 
@@ -121,29 +128,28 @@ def sqlmesh_model_list(project_path: Optional[str] = None) -> str:
         project_path: Path to the SQLMesh project. Defaults to
                       SQLMESH_PROJECT_PATH env var or the current directory.
     """
-    try:
-        ctx = _get_context(project_path)
-        rows = []
-        for name, model in sorted(ctx.models.items()):
-            row: dict[str, Any] = {"name": str(name)}
-            if hasattr(model, "kind"):
-                row["kind"] = str(model.kind.name)
-            if hasattr(model, "cron") and model.cron:
-                row["cron"] = str(model.cron)
-            if hasattr(model, "dialect") and model.dialect:
-                row["dialect"] = str(model.dialect)
-            if hasattr(model, "grain") and model.grain:
-                row["grain"] = [str(g) for g in model.grain]
-            if hasattr(model, "tags") and model.tags:
-                row["tags"] = sorted(str(t) for t in model.tags)
-            rows.append(row)
-        return json.dumps(rows, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = """
+    rows = []
+    for name, model in sorted(ctx.models.items()):
+        row = {"name": str(name)}
+        if hasattr(model, "kind"):
+            row["kind"] = str(model.kind.name)
+        if hasattr(model, "cron") and model.cron:
+            row["cron"] = str(model.cron)
+        if hasattr(model, "dialect") and model.dialect:
+            row["dialect"] = str(model.dialect)
+        if hasattr(model, "grain") and model.grain:
+            row["grain"] = [str(g) for g in model.grain]
+        if hasattr(model, "tags") and model.tags:
+            row["tags"] = sorted(str(t) for t in model.tags)
+        rows.append(row)
+    print(json.dumps(rows, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_model_info(
+async def sqlmesh_model_info(
     model_name: str,
     project_path: Optional[str] = None,
 ) -> str:
@@ -157,45 +163,35 @@ def sqlmesh_model_info(
         model_name:   Fully-qualified model name, e.g. ``"db.my_model"``.
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        model = ctx.get_model(model_name)
-        if model is None:
-            available = sorted(ctx.models.keys())
-            return (
-                f"Model '{model_name}' not found.\n"
-                f"Available models:\n{json.dumps(available, indent=2)}"
-            )
-
-        info: dict[str, Any] = {"name": str(model.name)}
-
+    script = f"""
+    model = ctx.get_model({model_name!r})
+    if model is None:
+        available = sorted(str(k) for k in ctx.models.keys())
+        print(json.dumps({{"error": "Model not found", "available": available}}, indent=2))
+    else:
+        info = {{"name": str(model.name)}}
         for attr in ("kind", "cron", "dialect", "stamp"):
             val = getattr(model, attr, None)
             if val is not None:
                 info[attr] = str(val.name) if attr == "kind" else str(val)
-
         for list_attr in ("grain", "tags", "audits"):
             val = getattr(model, list_attr, None)
             if val:
                 info[list_attr] = [str(v) for v in val]
-
         if hasattr(model, "partitioned_by_") and model.partitioned_by_:
             info["partitioned_by"] = [str(p) for p in model.partitioned_by_]
-
         if hasattr(model, "columns_to_types") and model.columns_to_types:
-            info["columns"] = {k: str(v) for k, v in model.columns_to_types.items()}
-
+            info["columns"] = {{k: str(v) for k, v in model.columns_to_types.items()}}
         if hasattr(model, "query") and model.query is not None:
             q = str(model.query)
             info["query_preview"] = q[:600] + ("  [truncated]" if len(q) > 600 else "")
-
-        return json.dumps(info, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+        print(json.dumps(info, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_model_render(
+async def sqlmesh_model_render(
     model_name: str,
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -212,21 +208,20 @@ def sqlmesh_model_render(
         end:          Optional end date.
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {}
-        if start:
-            kwargs["start"] = start
-        if end:
-            kwargs["end"] = end
-        expr = ctx.render(model_name, **kwargs)
-        return str(expr)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = f"""
+    kwargs = {{}}
+    if {start!r}:
+        kwargs["start"] = {start!r}
+    if {end!r}:
+        kwargs["end"] = {end!r}
+    expr = ctx.render({model_name!r}, **kwargs)
+    print(str(expr))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_plan(
+async def sqlmesh_plan(
     environment: str = "dev",
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -246,62 +241,60 @@ def sqlmesh_plan(
         select_models: Comma-separated model names to limit the plan scope.
         project_path:  Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {
-            "environment": environment,
-            "no_prompts": True,
-            "auto_apply": False,
-        }
-        if start:
-            kwargs["start"] = start
-        if end:
-            kwargs["end"] = end
-        if select_models:
-            kwargs["select_models"] = [m.strip() for m in select_models.split(",")]
+    models_list = f"[m.strip() for m in {select_models!r}.split(',')]" if select_models else "None"
+    script = f"""
+    kwargs = {{
+        "environment": {environment!r},
+        "no_prompts": True,
+        "auto_apply": False,
+    }}
+    if {start!r}:
+        kwargs["start"] = {start!r}
+    if {end!r}:
+        kwargs["end"] = {end!r}
+    select = {models_list}
+    if select:
+        kwargs["select_models"] = select
 
-        _, _ = _capture_stdout(lambda: None)  # warm up
-        plan = ctx.plan(**kwargs)
+    plan = ctx.plan(**kwargs)
 
-        result: dict[str, Any] = {
-            "environment": environment,
-            "has_changes": bool(plan.has_changes),
-            "requires_backfill": bool(plan.requires_backfill),
-            "new_models": [],
-            "modified_models": {},
-            "missing_intervals": [],
-        }
+    result = {{
+        "environment": {environment!r},
+        "has_changes": bool(plan.has_changes),
+        "requires_backfill": bool(plan.requires_backfill),
+        "new_models": [],
+        "modified_models": {{}},
+        "missing_intervals": [],
+    }}
 
-        if plan.new_snapshots:
-            result["new_models"] = [str(s.name) for s in plan.new_snapshots]
+    if plan.new_snapshots:
+        result["new_models"] = [str(s.name) for s in plan.new_snapshots]
 
-        if plan.modified_snapshots:
-            for name, (current, previous) in plan.modified_snapshots.items():
-                result["modified_models"][str(name)] = {
-                    "current_change_category": str(current.change_category)
-                    if hasattr(current, "change_category")
-                    else None,
-                }
+    if plan.modified_snapshots:
+        for name, (current, previous) in plan.modified_snapshots.items():
+            result["modified_models"][str(name)] = {{
+                "current_change_category": str(current.change_category)
+                if hasattr(current, "change_category")
+                else None,
+            }}
 
-        if plan.missing_intervals:
-            for snapshot, intervals in plan.missing_intervals:
-                result["missing_intervals"].append(
-                    {
-                        "model": str(snapshot.name),
-                        "interval_count": len(intervals),
-                    }
-                )
+    if plan.missing_intervals:
+        for snapshot, intervals in plan.missing_intervals:
+            result["missing_intervals"].append({{
+                "model": str(snapshot.name),
+                "interval_count": len(intervals),
+            }})
 
-        if not result["has_changes"] and not result["requires_backfill"]:
-            result["status"] = "Environment is up to date — no changes detected."
+    if not result["has_changes"] and not result["requires_backfill"]:
+        result["status"] = "Environment is up to date — no changes detected."
 
-        return json.dumps(result, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    print(json.dumps(result, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_apply(
+async def sqlmesh_apply(
     environment: str = "dev",
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -311,7 +304,7 @@ def sqlmesh_apply(
     """
     Apply a SQLMesh plan to an environment (plan + auto-apply in one step).
 
-    ⚠️  This modifies the target environment.  Use ``sqlmesh_plan`` first to
+    This modifies the target environment.  Use ``sqlmesh_plan`` first to
     preview changes before calling this tool.
 
     Args:
@@ -321,28 +314,34 @@ def sqlmesh_apply(
         select_models: Comma-separated model names to limit scope.
         project_path:  Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {
-            "environment": environment,
-            "no_prompts": True,
-            "auto_apply": True,
-        }
-        if start:
-            kwargs["start"] = start
-        if end:
-            kwargs["end"] = end
-        if select_models:
-            kwargs["select_models"] = [m.strip() for m in select_models.split(",")]
+    models_list = f"[m.strip() for m in {select_models!r}.split(',')]" if select_models else "None"
+    script = f"""
+    import io
+    from contextlib import redirect_stdout
+    kwargs = {{
+        "environment": {environment!r},
+        "no_prompts": True,
+        "auto_apply": True,
+    }}
+    if {start!r}:
+        kwargs["start"] = {start!r}
+    if {end!r}:
+        kwargs["end"] = {end!r}
+    select = {models_list}
+    if select:
+        kwargs["select_models"] = select
 
-        _, output = _capture_stdout(ctx.plan, **kwargs)
-        return output or f"Changes applied to environment '{environment}' successfully."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ctx.plan(**kwargs)
+    output = buf.getvalue().strip()
+    print(output or "Changes applied to environment '{environment}' successfully.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_run(
+async def sqlmesh_run(
     environment: str = "prod",
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -361,24 +360,30 @@ def sqlmesh_run(
         select_models: Comma-separated model names to limit execution.
         project_path:  Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {"environment": environment}
-        if start:
-            kwargs["start"] = start
-        if end:
-            kwargs["end"] = end
-        if select_models:
-            kwargs["select_models"] = [m.strip() for m in select_models.split(",")]
+    models_list = f"[m.strip() for m in {select_models!r}.split(',')]" if select_models else "None"
+    script = f"""
+    import io
+    from contextlib import redirect_stdout
+    kwargs = {{"environment": {environment!r}}}
+    if {start!r}:
+        kwargs["start"] = {start!r}
+    if {end!r}:
+        kwargs["end"] = {end!r}
+    select = {models_list}
+    if select:
+        kwargs["select_models"] = select
 
-        _, output = _capture_stdout(ctx.run, **kwargs)
-        return output or f"Run completed for environment '{environment}'."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ctx.run(**kwargs)
+    output = buf.getvalue().strip()
+    print(output or "Run completed for environment '{environment}'.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_test(
+async def sqlmesh_test(
     match_patterns: Optional[str] = None,
     project_path: Optional[str] = None,
 ) -> str:
@@ -394,39 +399,41 @@ def sqlmesh_test(
                         If omitted, all tests are run.
         project_path:   Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {}
-        if match_patterns:
-            kwargs["match_patterns"] = [p.strip() for p in match_patterns.split(",")]
+    patterns_list = f"[p.strip() for p in {match_patterns!r}.split(',')]" if match_patterns else "None"
+    script = f"""
+    import io
+    kwargs = {{}}
+    patterns = {patterns_list}
+    if patterns:
+        kwargs["match_patterns"] = patterns
 
-        buf = io.StringIO()
-        result = ctx.test(stream=buf, **kwargs)
-        output = buf.getvalue().strip()
+    buf = io.StringIO()
+    result = ctx.test(stream=buf, **kwargs)
+    output = buf.getvalue().strip()
 
-        passed = result.testsRun - len(result.failures) - len(result.errors)
-        summary = {
-            "tests_run": result.testsRun,
-            "passed": passed,
-            "failures": len(result.failures),
-            "errors": len(result.errors),
-            "output": output,
-        }
-        if result.failures:
-            summary["failure_details"] = [
-                {"test": str(t), "message": msg} for t, msg in result.failures
-            ]
-        if result.errors:
-            summary["error_details"] = [
-                {"test": str(t), "message": msg} for t, msg in result.errors
-            ]
-        return json.dumps(summary, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    passed = result.testsRun - len(result.failures) - len(result.errors)
+    summary = {{
+        "tests_run": result.testsRun,
+        "passed": passed,
+        "failures": len(result.failures),
+        "errors": len(result.errors),
+        "output": output,
+    }}
+    if result.failures:
+        summary["failure_details"] = [
+            {{"test": str(t), "message": msg}} for t, msg in result.failures
+        ]
+    if result.errors:
+        summary["error_details"] = [
+            {{"test": str(t), "message": msg}} for t, msg in result.errors
+        ]
+    print(json.dumps(summary, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_audit(
+async def sqlmesh_audit(
     start: str,
     end: str,
     models: Optional[str] = None,
@@ -444,21 +451,26 @@ def sqlmesh_audit(
         models:       Comma-separated model names to audit. If omitted, audits all.
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {"start": start, "end": end}
-        if models:
-            import itertools
-            kwargs["models"] = iter([m.strip() for m in models.split(",")])
+    models_list = f"iter([m.strip() for m in {models!r}.split(',')])" if models else "None"
+    script = f"""
+    import io
+    from contextlib import redirect_stdout
+    kwargs = {{"start": {start!r}, "end": {end!r}}}
+    models_iter = {models_list}
+    if models_iter is not None:
+        kwargs["models"] = models_iter
 
-        _, output = _capture_stdout(ctx.audit, **kwargs)
-        return output or "All audits passed."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ctx.audit(**kwargs)
+    output = buf.getvalue().strip()
+    print(output or "All audits passed.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_dag(
+async def sqlmesh_dag(
     model_name: Optional[str] = None,
     direction: str = "both",
     project_path: Optional[str] = None,
@@ -475,32 +487,32 @@ def sqlmesh_dag(
         direction:    ``"upstream"``, ``"downstream"``, or ``"both"`` (default).
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        dag = ctx.dag
+    script = f"""
+    dag = ctx.dag
+    model_name = {model_name!r}
+    direction = {direction!r}
 
-        if model_name:
-            result: dict[str, Any] = {"model": model_name}
-            if direction in ("upstream", "both"):
-                result["upstream"] = [str(n) for n in sorted(dag.upstream(model_name))]
-            if direction in ("downstream", "both"):
-                result["downstream"] = [str(n) for n in dag.downstream(model_name)]
-        else:
-            # Full DAG — one entry per node
-            result = {}
-            for node, deps in dag.graph.items():
-                result[str(node)] = {
-                    "upstream": [str(d) for d in sorted(deps)],
-                    "downstream": [str(n) for n in dag.downstream(node)],
-                }
+    if model_name:
+        result = {{"model": model_name}}
+        if direction in ("upstream", "both"):
+            result["upstream"] = [str(n) for n in sorted(dag.upstream(model_name))]
+        if direction in ("downstream", "both"):
+            result["downstream"] = [str(n) for n in dag.downstream(model_name)]
+    else:
+        result = {{}}
+        for node, deps in dag.graph.items():
+            result[str(node)] = {{
+                "upstream": [str(d) for d in sorted(deps)],
+                "downstream": [str(n) for n in dag.downstream(node)],
+            }}
 
-        return json.dumps(result, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    print(json.dumps(result, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_lineage(
+async def sqlmesh_lineage(
     model_name: str,
     column_name: Optional[str] = None,
     project_path: Optional[str] = None,
@@ -516,17 +528,14 @@ def sqlmesh_lineage(
         column_name:  Specific column to trace. If omitted, traces all columns.
         project_path: Path to the SQLMesh project.
     """
-    try:
-        args = ["lineage", model_name]
-        if column_name:
-            args += ["--column", column_name]
-        return _run_cli(args, project_path)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    args = ["lineage", model_name]
+    if column_name:
+        args += ["--column", column_name]
+    return await _run_cli(args, project_path)
 
 
 @mcp.tool()
-def sqlmesh_environment_list(project_path: Optional[str] = None) -> str:
+async def sqlmesh_environment_list(project_path: Optional[str] = None) -> str:
     """
     List all SQLMesh environments and their snapshot counts.
 
@@ -535,26 +544,25 @@ def sqlmesh_environment_list(project_path: Optional[str] = None) -> str:
     Args:
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        envs = ctx.state_reader.get_environments()
-        result = []
-        for env in envs:
-            entry: dict[str, Any] = {"name": str(env.name)}
-            if hasattr(env, "snapshots"):
-                entry["snapshot_count"] = len(env.snapshots)
-            if hasattr(env, "expiration_ts") and env.expiration_ts:
-                entry["expiration_ts"] = str(env.expiration_ts)
-            if hasattr(env, "suffix_target") and env.suffix_target:
-                entry["suffix_target"] = str(env.suffix_target)
-            result.append(entry)
-        return json.dumps(result, indent=2)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = """
+    envs = ctx.state_reader.get_environments()
+    result = []
+    for env in envs:
+        entry = {"name": str(env.name)}
+        if hasattr(env, "snapshots"):
+            entry["snapshot_count"] = len(env.snapshots)
+        if hasattr(env, "expiration_ts") and env.expiration_ts:
+            entry["expiration_ts"] = str(env.expiration_ts)
+        if hasattr(env, "suffix_target") and env.suffix_target:
+            entry["suffix_target"] = str(env.suffix_target)
+        result.append(entry)
+    print(json.dumps(result, indent=2))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_diff(
+async def sqlmesh_diff(
     environment: str = "dev",
     detailed: bool = False,
     project_path: Optional[str] = None,
@@ -569,16 +577,20 @@ def sqlmesh_diff(
         detailed:     Include detailed column-level diff (default: False).
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        _, output = _capture_stdout(ctx.diff, environment=environment, detailed=detailed)
-        return output or f"No differences between '{environment}' and prod."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = f"""
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ctx.diff(environment={environment!r}, detailed={detailed!r})
+    output = buf.getvalue().strip()
+    print(output or "No differences between '{environment}' and prod.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_table_diff(
+async def sqlmesh_table_diff(
     source: str,
     target: str,
     model_name: Optional[str] = None,
@@ -599,27 +611,33 @@ def sqlmesh_table_diff(
         limit:        Maximum differing rows to return (default: 20).
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        kwargs: dict[str, Any] = {
-            "source": source,
-            "target": target,
-            "limit": limit,
-            "show": False,
-        }
-        if model_name:
-            kwargs["select_models"] = [model_name]
-        if on_columns:
-            kwargs["on"] = [c.strip() for c in on_columns.split(",")]
+    on_list = f"[c.strip() for c in {on_columns!r}.split(',')]" if on_columns else "None"
+    script = f"""
+    import io
+    from contextlib import redirect_stdout
+    kwargs = {{
+        "source": {source!r},
+        "target": {target!r},
+        "limit": {limit!r},
+        "show": False,
+    }}
+    if {model_name!r}:
+        kwargs["select_models"] = [{model_name!r}]
+    on = {on_list}
+    if on:
+        kwargs["on"] = on
 
-        _, output = _capture_stdout(ctx.table_diff, **kwargs)
-        return output or "No differences found between the two environments."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ctx.table_diff(**kwargs)
+    output = buf.getvalue().strip()
+    print(output or "No differences found between the two environments.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_fetchdf(
+async def sqlmesh_fetchdf(
     query: str,
     limit: int = 100,
     project_path: Optional[str] = None,
@@ -634,24 +652,23 @@ def sqlmesh_fetchdf(
         limit:        Maximum rows to return (default: 100).
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        q = query.strip().rstrip(";")
-        if "limit" not in q.lower():
-            q = f"{q} LIMIT {limit}"
-        df = ctx.fetchdf(q)
-        result = {
-            "row_count": len(df),
-            "columns": list(df.columns),
-            "rows": df.head(limit).to_dict(orient="records"),
-        }
-        return json.dumps(result, indent=2, default=str)
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = f"""
+    q = {query!r}.strip().rstrip(";")
+    if "limit" not in q.lower():
+        q = f"{{q}} LIMIT {limit}"
+    df = ctx.fetchdf(q)
+    result = {{
+        "row_count": len(df),
+        "columns": list(df.columns),
+        "rows": df.head({limit}).to_dict(orient="records"),
+    }}
+    print(json.dumps(result, indent=2, default=str))
+"""
+    return await _run_python_script(script, project_path)
 
 
 @mcp.tool()
-def sqlmesh_invalidate_environment(
+async def sqlmesh_invalidate_environment(
     environment: str,
     project_path: Optional[str] = None,
 ) -> str:
@@ -664,12 +681,11 @@ def sqlmesh_invalidate_environment(
         environment:  Name of the environment to invalidate (e.g. ``"dev"``).
         project_path: Path to the SQLMesh project.
     """
-    try:
-        ctx = _get_context(project_path)
-        ctx.invalidate_environment(environment)
-        return f"Environment '{environment}' has been invalidated and scheduled for cleanup."
-    except Exception as exc:
-        return f"Error: {exc}\n{traceback.format_exc()}"
+    script = f"""
+    ctx.invalidate_environment({environment!r})
+    print("Environment '{environment}' has been invalidated and scheduled for cleanup.")
+"""
+    return await _run_python_script(script, project_path)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
