@@ -36,7 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "sqlmesh-mcp",
-    description=(
+    instructions=(
         "MCP server for SQLMesh — the next-generation data transformation framework. "
         "Provides tools for model inspection, planning, execution, testing, lineage, "
         "and environment management."
